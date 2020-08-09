@@ -33,6 +33,65 @@
 #define BL_STATE_STANDBY	BL_CORE_FBBLANK
 #define BL_STATE_LP		BL_CORE_DRIVER1
 #define BL_STATE_LP2		BL_CORE_DRIVER2
+#define BL_HBM 			1023
+
+static int hbm_enable = 0;
+static struct dsi_backlight_config *bl_g;
+static struct device *fb0_device;
+
+static void enable_hbm(int enable)
+{
+	struct dsi_panel *panel = container_of(bl_g, struct dsi_panel, bl_config);
+	struct hbm_data *hbm = bl_g->hbm;
+	struct hbm_range *range = NULL;
+	u32 target_range = enable ? bl_g->hbm->num_ranges - 1 : 0;
+	range = hbm->ranges + target_range;
+
+	if (dsi_backlight_get_dpms(&panel->bl_config) == SDE_MODE_DPMS_ON) {
+		if(dsi_panel_cmd_set_transfer(panel, enable ? &range->entry_cmd : &range->dimming_stop_cmd))
+			pr_err("Failed to send command for range %d\n",	enable);
+	}
+}
+
+static ssize_t hbm_show(struct device *device, struct device_attribute *attr,
+		      char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", hbm_enable);
+}
+
+static ssize_t hbm_store(struct device *device, struct device_attribute *attr,
+		       const char *buf, size_t count)
+{
+	int ret, val;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	if (val < 0 || val > 1)
+		val = 0;
+
+	hbm_enable = val;
+	enable_hbm(hbm_enable);
+	backlight_update_status(bl_g->bl_device);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(hbm);
+
+static void fb0_init_device(struct dsi_backlight_config *bl)
+{
+	bl_g = bl;
+	fb0_device = device_create(fb_class, NULL, MKDEV(0, 0), NULL, "fb0");
+	if (IS_ERR(fb0_device)) {
+		fb0_device = NULL;
+		return;
+	}
+
+	if (device_create_file(fb0_device, &dev_attr_hbm))
+		pr_warn("unable to create hbm node\n");
+}
 
 struct dsi_backlight_pwm_config {
 	bool pwm_pmi_control;
@@ -385,6 +444,10 @@ static u32 dsi_backlight_calculate(struct dsi_backlight_config *bl,
 	bl_temp = mult_frac(bl_temp, bl->bl_scale_ad,
 			MAX_AD_BL_SCALE_LEVEL);
 
+	if (hbm_enable) {
+		return BL_HBM;
+	}
+
 	if (panel->hbm_mode)
 		bl_lvl = dsi_backlight_calculate_hbm(bl, bl_temp);
 	else
@@ -405,11 +468,12 @@ static int dsi_backlight_update_status(struct backlight_device *bd)
 	int bl_lvl;
 	int rc = 0;
 
+	mutex_lock(&panel->panel_lock);
+	mutex_lock(&bl->state_lock);
 	if ((bd->props.state & (BL_CORE_FBBLANK | BL_CORE_SUSPENDED)) ||
 			(bd->props.power != FB_BLANK_UNBLANK))
 		brightness = 0;
 
-	mutex_lock(&panel->panel_lock);
 	bl_lvl = dsi_backlight_calculate(bl, brightness);
 	if (bl_lvl == bl->bl_actual && bl->last_state == bd->props.state)
 		goto done;
@@ -439,6 +503,7 @@ static int dsi_backlight_update_status(struct backlight_device *bd)
 	bl->last_state = bd->props.state;
 
 done:
+	mutex_unlock(&bl->state_lock);
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
@@ -709,6 +774,9 @@ static int dsi_backlight_register(struct dsi_backlight_config *bl)
 	if (sysfs_create_groups(&bl->bl_device->dev.kobj, bl_device_groups))
 		pr_warn("unable to create device groups\n");
 
+	//make dummy fb0 device so we have the old standard hbm sysfs path
+	fb0_init_device(bl);
+
 	reg = regulator_get(panel->parent, "lab");
 	if (!PTR_ERR_OR_ZERO(reg)) {
 		pr_info("LAB regulator found\n");
@@ -756,7 +824,7 @@ int dsi_backlight_early_dpms(struct dsi_backlight_config *bl, int power_mode)
 
 	pr_info("power_mode:%d state:0x%0x\n", power_mode, bd->props.state);
 
-	mutex_lock(&bd->ops_lock);
+	mutex_lock(&bl->state_lock);
 	state = get_state_after_dpms(bl, power_mode);
 
 	if (bl->lab_vreg) {
@@ -766,8 +834,7 @@ int dsi_backlight_early_dpms(struct dsi_backlight_config *bl, int power_mode)
 		if (last_mode != mode)
 			regulator_set_mode(bl->lab_vreg, mode);
 	}
-
-	mutex_unlock(&bd->ops_lock);
+	mutex_unlock(&bl->state_lock);
 
 	return 0;
 }
@@ -782,15 +849,15 @@ int dsi_backlight_late_dpms(struct dsi_backlight_config *bl, int power_mode)
 
 	pr_debug("power_mode:%d state:0x%0x\n", power_mode, bd->props.state);
 
-	mutex_lock(&bd->ops_lock);
+	mutex_lock(&bl->state_lock);
 	state = get_state_after_dpms(bl, power_mode);
 
 	bd->props.power = state & BL_CORE_FBBLANK ? FB_BLANK_POWERDOWN :
 			FB_BLANK_UNBLANK;
 	bd->props.state = state;
 
+	mutex_unlock(&bl->state_lock);
 	backlight_update_status(bd);
-	mutex_unlock(&bd->ops_lock);
 
 	return 0;
 }
@@ -801,10 +868,10 @@ int dsi_backlight_get_dpms(struct dsi_backlight_config *bl)
 	int power = 0;
 	int state = 0;
 
-	mutex_lock(&bd->ops_lock);
+	mutex_lock(&bl->state_lock);
 	power = bd->props.power;
 	state = bd->props.state;
-	mutex_unlock(&bd->ops_lock);
+	mutex_unlock(&bl->state_lock);
 
 	if (power == FB_BLANK_POWERDOWN)
 		return SDE_MODE_DPMS_OFF;
@@ -1161,6 +1228,7 @@ int dsi_panel_bl_register(struct dsi_panel *panel)
 	const struct of_device_id *match;
 	int (*register_func)(struct dsi_backlight_config *) = NULL;
 
+	mutex_init(&bl->state_lock);
 	match = of_match_node(dsi_backlight_dt_match, panel->panel_of_node);
 	if (match && match->data) {
 		register_func = match->data;
@@ -1198,6 +1266,7 @@ int dsi_panel_bl_unregister(struct dsi_panel *panel)
 {
 	struct dsi_backlight_config *bl = &panel->bl_config;
 
+	mutex_destroy(&bl->state_lock);
 	if (bl->unregister)
 		bl->unregister(bl);
 
